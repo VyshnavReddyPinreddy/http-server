@@ -1,0 +1,10 @@
+# Compiled binaries
+s
+c
+*.o
+
+# VS Code
+.vscode/
+
+# Linux temp files
+*~
