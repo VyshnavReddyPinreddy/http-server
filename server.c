@@ -116,34 +116,116 @@ int parse_http_request(char *buffer,HttpRequest *request){
     return 0;
 }
 
-void send_response(int client_fd,const char *status,const char *content_type,const char *body){
-    char response[4096];
-    int body_length=strlen(body);
+void send_response(int client_fd,const char *status,const char *content_type,const void *body,size_t body_length){
+    char header[1024];
+    int header_length = snprintf(header,
+                                sizeof(header),
+                                "HTTP/1.1 %s\r\n"
+                                "Content-type: %s\r\n"
+                                "Content-Length: %zu\r\n"
+                                "Connection: close\r\n"
+                                "\r\n",
+                                status,
+                                content_type,
+                                body_length
+                                );
+    
+    if(send(client_fd,header,header_length,0)<0){
+        perror("send");
+        return;
+    }                           
+    if(body_length>0){  
+        if(send(client_fd,body,body_length,0)<0){
+            perror("send");
+        }
+    }
+}
 
-    snprintf(response,
-            "HTTP/1.1 %s\r\n"
-            "Content-type: %s\r\n"
-            "Content-length: %d\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "%s",
-            status,
-            content_type,
-            body_length,
-            body
-    );
+int read_file(const char *filename,void **buffer,size_t *file_size){
+    FILE *fp = fopen(filename,"rb");
+    if(fp==NULL){
+        return -1;
+    }
 
-    send(client_fd,response,strlen(response),0);
+    fseek(fp,0,SEEK_END); // Move to eof
+    *file_size=ftell(fp);
+    rewind(fp); // Go back to beginning
+
+    *buffer = malloc(*file_size);
+    if(*buffer==NULL){
+        fclose(fp);
+        return -1;
+    }
+
+    size_t bytes_read = fread(*buffer,1,*file_size,fp);
+    fclose(fp);
+
+    if(bytes_read != *file_size){
+        free(*buffer);
+        return -1;
+    }
+    
+    return 0;
+}
+
+void serve_file(int client_fd,const char*filename,const char *content_type){
+    void *body = NULL;
+    size_t body_length = 0;
+
+    if(read_file(filename,&body,&body_length)!=0){
+        const char *msg = "404 Not Found";
+        send_response(client_fd,"404 Not Found","text/plain",msg,strlen(msg));
+        return;
+    }
+    // printf("Read %d bytes from %s\n", bytes, filename);
+    send_response(client_fd,"200 OK",content_type,body,body_length);
+
+    free(body);
+}
+
+const char *get_mime_type(const char *filename){
+    char *ext = strrchr(filename,'.');
+
+    if(ext == NULL)
+        return "application/octet-stream";
+
+    if(strcmp(ext,".html")==0)
+        return "text/html";
+
+    if(strcmp(ext,".css")==0)
+        return "text/css";
+
+    if(strcmp(ext,".js")==0)
+        return "application/javascript";
+
+    if(strcmp(ext,".png")==0)
+        return "image/png";
+
+    if(strcmp(ext,".jpg")==0)
+        return "image/jpeg";
+
+    if(strcmp(ext,".jpeg")==0)
+        return "image/jpeg";
+
+    if(strcmp(ext,".gif")==0)
+        return "image/gif";
+
+    if(strcmp(ext,".ico")==0)
+        return "image/x-icon";
+
+    return "application/octet-stream";
 }
 
 void route_request(int client_fd,HttpRequest *request){
+    char filename[512];
+
     if(strcmp(request->path,"/")==0){
-        send_response(client_fd,"200 OK","text/plain","Home Page");
-    }else if(strcmp(request->path,"/about")==0){
-        send_response(client_fd,"200 OK","text/plain","About Page");
+        strcpy(filename,"www/index.html");
     }else{
-        send_response(client_fd,"404 Not Found","text/plain","404 Not Found");
+        snprintf(filename,sizeof(filename),"www%s",request->path);
     }
+
+    serve_file(client_fd,filename,get_mime_type(filename));
 }
 
 void *handle_client(void *arg){
