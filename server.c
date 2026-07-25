@@ -9,6 +9,10 @@
 #include<sys/time.h>
 #include<errno.h>
 #include <limits.h> // Gives PATH_MAX
+// the below three headers are for sendfile() feature
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/sendfile.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
@@ -212,21 +216,61 @@ int read_file(const char *filename,void **buffer,size_t *file_size){
 }
 
 size_t serve_file(int client_fd,const char*filename,const char *content_type,int keep_alive,int send_body){
-    void *body = NULL;
-    size_t body_length = 0;
+    // ----------------- Before sendfile() -----------------------------------
+    
+    // void *body = NULL;
+    // size_t body_length = 0;
 
-    if(read_file(filename,&body,&body_length)!=0){
-        // const char *msg = "404 Not Found";
-        // send_response(client_fd,"404 Not Found","text/plain",msg,strlen(msg),keep_alive,send_body);
-        // return strlen(msg);
-        perror("read_file");
+    // if(read_file(filename,&body,&body_length)!=0){
+    //     // const char *msg = "404 Not Found";
+    //     // send_response(client_fd,"404 Not Found","text/plain",msg,strlen(msg),keep_alive,send_body);
+    //     // return strlen(msg);
+    //     perror("read_file");
+    //     return 0;
+    // }
+    // // printf("Read %d bytes from %s\n", bytes, filename);
+    // send_response(client_fd,"200 OK",content_type,body,body_length,keep_alive,send_body);
+
+    // free(body);
+    // return body_length;
+
+    // --------------- After sendfile() --------------------------------------
+
+    int fd = open(filename,O_RDONLY);
+    if(fd<0){
+        perror("open");
         return 0;
     }
-    // printf("Read %d bytes from %s\n", bytes, filename);
-    send_response(client_fd,"200 OK",content_type,body,body_length,keep_alive,send_body);
+    
+    struct stat st;
+    if(fstat(fd,&st)<0){
+        perror("fstat");
+        close(fd);
+        return 0;
+    }
 
-    free(body);
-    return body_length;
+    off_t file_size = st.st_size;
+
+    // Send headers only
+    send_response(client_fd,"200 OK",content_type,NULL,file_size,keep_alive,0);
+
+    if(!send_body){
+        close(fd);
+        return file_size;
+    }
+
+    off_t offset = 0;
+
+    while(offset<file_size){
+        ssize_t sent = sendfile(client_fd,fd,&offset,file_size-offset);
+        if(sent<=0){
+            perror("sendfile");
+            break;
+        }
+    }
+
+    close(fd);
+    return (size_t)file_size;
 }
 
 const char *get_mime_type(const char *filename){
