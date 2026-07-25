@@ -6,13 +6,24 @@
 #include<arpa/inet.h>
 #include<string.h>
 #include<pthread.h>
+#include<sys/time.h>
+#include<errno.h>
+#include <limits.h> // Gives PATH_MAX
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
 #define MAX_HEADERS 32
+#define DOCUMENT_ROOT "www"
 
-typedef struct
-{
+enum CloseReason {
+    CLOSE_TIMEOUT,
+    CLOSE_CLIENT,
+    CLOSE_ERROR,
+    CLOSE_HTTP_ERROR,
+    CLOSE_HTTP_CLOSE
+};
+
+typedef struct{
     char key[64];
     char value[256];
 } Header;
@@ -26,6 +37,17 @@ typedef struct {
     int header_count;
 
 } HttpRequest;
+
+typedef struct {
+    int client_fd;
+    char client_ip[INET_ADDRSTRLEN];
+    int client_port;
+} ClientInfo;
+
+typedef struct {
+    int status_code;
+    size_t bytes_sent;
+} ResponseInfo;
 
 int create_server_socket(){
     // Create Socket
@@ -65,7 +87,7 @@ int create_server_socket(){
     }
     
 	printf("Server listening on port %d...\n",PORT);
-
+    printf("\n");
     return server_fd;
 }
 
@@ -87,6 +109,25 @@ int accept_client(int server_fd, struct sockaddr_in *client_addr){
 
     printf("Client connected from %s:%d\n",ip,ntohs(client_addr->sin_port));
     return client_fd;
+}
+
+int should_keep_alive(HttpRequest *request){
+    for(int i=0;i<request->header_count;i++){
+        if(strcasecmp(request->headers[i].key,"Connection")==0){
+            if(strcasecmp(request->headers[i].value,"keep-alive")==0){
+                return 1;
+            }
+            if(strcasecmp(request->headers[i].value,"close")==0){
+                return 0;
+            }
+        }
+    }
+
+    // HTTP 1.1 defaults to keep-alive
+    if(strcmp(request->version,"HTTP/1.1")==0){
+        return 1;
+    }
+    return 0;
 }
 
 int parse_http_request(char *buffer,HttpRequest *request){
@@ -116,25 +157,27 @@ int parse_http_request(char *buffer,HttpRequest *request){
     return 0;
 }
 
-void send_response(int client_fd,const char *status,const char *content_type,const void *body,size_t body_length){
+void send_response(int client_fd,const char *status,const char *content_type,const void *body,size_t body_length,int keep_alive,int send_body){
     char header[1024];
     int header_length = snprintf(header,
                                 sizeof(header),
                                 "HTTP/1.1 %s\r\n"
                                 "Content-type: %s\r\n"
                                 "Content-Length: %zu\r\n"
-                                "Connection: close\r\n"
+                                "Connection: %s\r\n"
                                 "\r\n",
                                 status,
                                 content_type,
-                                body_length
+                                body_length,
+                                keep_alive ? "keep-alive" : "close"
                                 );
     
     if(send(client_fd,header,header_length,0)<0){
         perror("send");
         return;
-    }                           
-    if(body_length>0){  
+    }         
+    // For HEAD method                  
+    if(send_body && body_length>0){  
         if(send(client_fd,body,body_length,0)<0){
             perror("send");
         }
@@ -168,19 +211,22 @@ int read_file(const char *filename,void **buffer,size_t *file_size){
     return 0;
 }
 
-void serve_file(int client_fd,const char*filename,const char *content_type){
+size_t serve_file(int client_fd,const char*filename,const char *content_type,int keep_alive,int send_body){
     void *body = NULL;
     size_t body_length = 0;
 
     if(read_file(filename,&body,&body_length)!=0){
-        const char *msg = "404 Not Found";
-        send_response(client_fd,"404 Not Found","text/plain",msg,strlen(msg));
-        return;
+        // const char *msg = "404 Not Found";
+        // send_response(client_fd,"404 Not Found","text/plain",msg,strlen(msg),keep_alive,send_body);
+        // return strlen(msg);
+        perror("read_file");
+        return 0;
     }
     // printf("Read %d bytes from %s\n", bytes, filename);
-    send_response(client_fd,"200 OK",content_type,body,body_length);
+    send_response(client_fd,"200 OK",content_type,body,body_length,keep_alive,send_body);
 
     free(body);
+    return body_length;
 }
 
 const char *get_mime_type(const char *filename){
@@ -216,95 +262,223 @@ const char *get_mime_type(const char *filename){
     return "application/octet-stream";
 }
 
-void route_request(int client_fd,HttpRequest *request){
-    char filename[512];
+int resolve_path(const char*request_path,char *resolved_path){
+    char root[PATH_MAX];
+    char requested[PATH_MAX];
 
-    if(strcmp(request->path,"/")==0){
-        strcpy(filename,"www/index.html");
-    }else{
-        snprintf(filename,sizeof(filename),"www%s",request->path);
+    if(realpath(DOCUMENT_ROOT,root)==NULL){
+        perror("realpath(root)");
+        return -1;
     }
 
-    serve_file(client_fd,filename,get_mime_type(filename));
+    // Build Requested path
+    snprintf(requested,sizeof(requested),"%s%s",DOCUMENT_ROOT,request_path);
+
+    // Canonicalize it 
+    if(realpath(requested,resolved_path)==NULL){
+        // File doesn't exist (or cannot be resolved)
+        return -1;
+    }
+
+    // is resolved path in the document root ? 
+    if(strncmp(root,resolved_path,strlen(root))!=0){
+        return -2;
+    }
+    return 0;
+}
+
+ResponseInfo route_request(int client_fd,HttpRequest *request,int keep_alive){
+    ResponseInfo res;
+
+    char filename[PATH_MAX];
+
+    const char *path = (strcmp(request->path,"/")==0) ? "/index.html" : request->path;
+
+    int send_body = 1;
+    if(strcmp(request->method,"HEAD")==0) send_body=0;
+
+    if(strcmp(request->method,"GET")!=0 && strcmp(request->method,"HEAD")!=0){
+        const char * msg = "405 Method not allowed";
+        res.status_code = 405;
+        res.bytes_sent = strlen(msg);
+
+        send_response(client_fd,
+                    "405 Method not allowed",
+                    "text/plain",
+                    msg,
+                    strlen(msg),
+                    keep_alive,
+                    1);
+        return res;
+    }
+
+    int status = resolve_path(path,filename);
+    if(status==-2){
+        const char *msg = "403 Forbidden";
+        res.status_code = 403;
+        res.bytes_sent = strlen(msg);
+        send_response(client_fd,
+                    "403 Forbidden",
+                    "text/plain",
+                    msg,
+                    strlen(msg),
+                    keep_alive,send_body);
+        return res;
+    }
+    if(status==-1){
+        const char *msg = "404 Not Found";
+        res.status_code = 404;
+        res.bytes_sent = strlen(msg);
+        send_response(client_fd,
+                    "404 Not Found",
+                    "text/plain",
+                    msg,
+                    strlen(msg),
+                    keep_alive,send_body);
+        return res;
+    }   
+
+    res.status_code = 200;
+    res.bytes_sent = serve_file(client_fd,filename,get_mime_type(filename),keep_alive,send_body);
+
+    return res; 
+}
+
+const char *format_size(size_t bytes,double *value){
+    if(bytes>=1024ULL*1024*1024){
+        *value = bytes/(1024.0*1024*1024);
+        return "GB";
+    }
+    if(bytes>=1024*1024){
+        *value = bytes/(1024.0*1024.0);
+        return "MB";
+    }
+    if(bytes>=1024){
+        *value = bytes/1024.0;
+        return "KB";
+    }
+    *value = (double)bytes;
+    return "B";
 }
 
 void *handle_client(void *arg){
-    int client_fd = *(int*)arg;
-    free(arg);
+    ClientInfo *client = (ClientInfo*)arg;
 
-    // Receive message
-    ssize_t bytes;
-    char buffer[BUFFER_SIZE] = {0};
+    int client_fd = client->client_fd;
+    char client_ip[INET_ADDRSTRLEN];
+    strcpy(client_ip,client->client_ip);
+    int client_port = client->client_port;
 
-    // For client.c file
-    
-    // while((bytes = recv(client_fd,buffer,BUFFER_SIZE-1,0)) > 0){
-    //     buffer[bytes] = '\0';
-    //     printf("Received : %s\n",buffer);
-        
-    //     if(send(client_fd,buffer,bytes,0)==-1) {
-    //         perror("send");
-    //         break;
-    //     }
-        
-    //     printf("Reply sent.\n");
-    // }
+    free(client);  
 
-    // For browswer clients 
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
 
-    bytes = recv(client_fd,buffer,BUFFER_SIZE-1,0);
-    if(bytes<=0){
-        close(client_fd);
-        return NULL;
-    }
+    setsockopt(client_fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
 
-    buffer[bytes]='\0';
+    enum CloseReason reason = CLOSE_CLIENT;
 
-    // printf("\n==========Actual Request==========\n");
-    // printf("%s\n", buffer);
-    // printf("==================================\n");
+    while(1){
+        // Receive message
+        ssize_t bytes;
+        char buffer[BUFFER_SIZE] = {0};
 
-    printf("\n========== HTTP REQUEST ==========\n");
-    
-    HttpRequest request;
-    if (parse_http_request(buffer, &request) != 0){
-        printf("Invalid HTTP Request\n");
-        close(client_fd);
-        return NULL;
-    }
-    printf("Method  : %s\n", request.method);
-    printf("Path    : %s\n", request.path);
-    printf("Version : %s\n", request.version);
-    printf("\nHeaders\n");
+        bytes = recv(client_fd,buffer,BUFFER_SIZE-1,0);
+        if(bytes<0){
+            if(errno==EAGAIN || errno==EWOULDBLOCK){
+                reason = CLOSE_TIMEOUT;
+            }else{
+                perror("recv");
+                reason = CLOSE_ERROR;
+            }
+            break;
+        }else if(bytes==0){
+            //TCP uses a FIN packet to say: "I have no more data to send."
+            // So bytes=0 , and client closed the connection 
+            // printf("[%s:%d] Client closed connection.\n", client_ip, client_port);
+            reason = CLOSE_HTTP_CLOSE;
+            break;
+        }
 
-    for(int i=0;i<request.header_count;i++){
-        printf("%s => %s\n",
-            request.headers[i].key,
-            request.headers[i].value);
-    }
-    printf("==================================\n");
+        buffer[bytes]='\0';
 
-    // const char *response =
-    // "HTTP/1.1 200 OK\r\n"
-    // "Content-Type: text/plain\r\n"
-    // "Content-Length: 13\r\n"
-    // "Connection: close\r\n"
-    // "\r\n"
-    // "Hello, World!";
+        // printf("\n========== HTTP REQUEST ==========\n");
+        // printf("%s\r\n",buffer);
+        // printf("==================================\n");
 
-    // if(send(client_fd,response,strlen(response),0)<0){
-    //     perror("send");
-    // }
+        HttpRequest request;
+        if (parse_http_request(buffer, &request) != 0){
+            reason = CLOSE_HTTP_ERROR;
+            break;
+        }
 
-    route_request(client_fd,&request);
+        int keep_alive = should_keep_alive(&request);
 
-    printf("Client disconnected.\n");
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        ResponseInfo res = route_request(client_fd,&request,keep_alive);
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+
+        double elapsed_ms = (end.tv_sec-start.tv_sec)*1000.0 + (end.tv_nsec-start.tv_nsec)/1000000.0;
+
+        char client_addr[64];
+        snprintf(client_addr,
+                sizeof(client_addr),
+                "%s:%d",
+                client_ip,
+                client_port);   
+
+        double size_value;
+        const char *size_unit = format_size(res.bytes_sent, &size_value);
+
+        printf("%-21s %-6s %-20s %-6d %7.1f %-2s %8.3f ms\n",
+                                                            client_addr,
+                                                            request.method,
+                                                            request.path,
+                                                            res.status_code,
+                                                            size_value,
+                                                            size_unit,
+                                                            elapsed_ms);
+
+        if(!keep_alive){
+            reason = CLOSE_CLIENT;
+            break;
+        }
+    }   
+
+    switch (reason) {
+        case CLOSE_TIMEOUT:
+            printf("[%s:%d] Connection closed (Keep-Alive timeout).\n",
+                client_ip, client_port);
+            break;
+
+        case CLOSE_CLIENT:
+            printf("[%s:%d] Connection closed by client.\n",
+                client_ip, client_port);
+            break;
+
+        case CLOSE_ERROR:
+            printf("[%s:%d] Connection closed due to recv error.\n",
+                client_ip, client_port);
+            break;
+
+        case CLOSE_HTTP_ERROR:
+            printf("[%s:%d] Connection closed due to HTTP request error.\n",
+                client_ip, client_port);
+            break;
+        case CLOSE_HTTP_CLOSE:
+            printf("[%s:%d] Connection closed (HTTP Connection: close).\n",
+                client_ip, client_port);
+            break;
+    }   
     close(client_fd);   
     return NULL;
 }
 
 int main(){
-
     int server_fd = create_server_socket();
     while(1){
         struct sockaddr_in client_addr;
@@ -313,17 +487,24 @@ int main(){
         
         pthread_t tid;
 
-        int *client_socket = malloc(sizeof(int));
-        if (client_socket == NULL) {
+        ClientInfo *client = malloc(sizeof(ClientInfo));
+        if (client == NULL) {
             perror("malloc");
             close(client_fd);
             continue;
         }
-        *client_socket = client_fd;
+        client->client_fd = client_fd;
 
-        if (pthread_create(&tid, NULL, handle_client, client_socket) != 0) {
+        inet_ntop(AF_INET,
+                &client_addr.sin_addr,
+                client->client_ip,
+                sizeof(client->client_ip));
+
+        client->client_port = ntohs(client_addr.sin_port);
+
+        if (pthread_create(&tid, NULL, handle_client, client) != 0) {
             perror("pthread_create");
-            free(client_socket);
+            free(client);
             close(client_fd);
             continue;
         }
