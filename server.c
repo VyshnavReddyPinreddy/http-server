@@ -18,6 +18,8 @@
 #define BUFFER_SIZE 1024
 #define MAX_HEADERS 32
 #define DOCUMENT_ROOT "www"
+#define THREAD_POOL_SIZE 4
+#define QUEUE_SIZE 128
 
 enum CloseReason {
     CLOSE_TIMEOUT,
@@ -49,9 +51,24 @@ typedef struct {
 } ClientInfo;
 
 typedef struct {
+    ClientInfo *jobs[QUEUE_SIZE];
+    int front;
+    int rear;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+} JobQueue;
+
+typedef struct {
     int status_code;
     size_t bytes_sent;
 } ResponseInfo;
+
+// Global Job Queue
+
+JobQueue job_queue;
+
 
 int create_server_socket(){
     // Create Socket
@@ -234,7 +251,7 @@ size_t serve_file(int client_fd,const char*filename,const char *content_type,int
     // free(body);
     // return body_length;
 
-    // --------------- After sendfile() --------------------------------------
+    // --------------- Using sendfile() --------------------------------------
 
     int fd = open(filename,O_RDONLY);
     if(fd<0){
@@ -405,9 +422,7 @@ const char *format_size(size_t bytes,double *value){
     return "B";
 }
 
-void *handle_client(void *arg){
-    ClientInfo *client = (ClientInfo*)arg;
-
+void handle_client(ClientInfo *client){
     int client_fd = client->client_fd;
     char client_ip[INET_ADDRSTRLEN];
     strcpy(client_ip,client->client_ip);
@@ -519,17 +534,111 @@ void *handle_client(void *arg){
             break;
     }   
     close(client_fd);   
-    return NULL;
+}
+
+void queue_init(JobQueue *queue){
+    queue->front = 0;
+    queue->rear  = 0;
+    queue->count=0;
+
+    pthread_mutex_init(&queue->mutex,NULL);
+    pthread_cond_init(&queue->not_empty,NULL);
+    pthread_cond_init(&queue->not_full,NULL);
+}
+
+void enqueue(JobQueue *queue,ClientInfo *client){
+    pthread_mutex_lock(&queue->mutex); // for avoiding race conditions on QUEUE
+
+    while(queue->count==QUEUE_SIZE){
+        pthread_cond_wait(&queue->not_full,&queue->mutex); // Wait until queue is NOT full . so that we can push one 
+    }
+
+    // queue is not full, so push a client into the queue
+
+    queue->jobs[queue->rear] = client;
+    queue->rear = (queue->rear+1)%QUEUE_SIZE;
+
+    queue->count++;
+
+    printf("[Main] Enqueued %s:%d | Queue size = %d\n",
+       client->client_ip,
+       client->client_port,
+       queue->count);
+
+    // signal queue is not empty, so that , any worker who wants to execute a job, might wake up    
+    pthread_cond_signal(&queue->not_empty);
+    pthread_mutex_unlock(&queue->mutex);
+}
+
+ClientInfo *dequeue(JobQueue *queue,int worker_id){
+    pthread_mutex_lock(&queue->mutex);   
+    
+    while(queue->count==0){
+        pthread_cond_wait(&queue->not_empty,&queue->mutex);
+    }
+
+    ClientInfo *client = queue->jobs[queue->front];
+    queue->front = (queue->front+1)%QUEUE_SIZE;
+
+    queue->count--;
+
+    printf("[Worker %d] Dequeued %s:%d | Queue size = %d\n",
+       worker_id,
+       client->client_ip,
+       client->client_port,
+       queue->count);
+
+    pthread_cond_signal(&queue->not_full);
+    pthread_mutex_unlock(&queue->mutex);
+
+    return client;
+}
+
+void *worker_thread(void *arg){
+    int worker_id = *(int*)arg;
+    free(arg);
+
+    printf("[Worker %d] Started\n", worker_id);
+
+    while(1){
+        ClientInfo *client = dequeue(&job_queue,worker_id);
+
+        printf("[Worker %d] Picked client %s:%d\n",
+                worker_id,
+                client->client_ip,
+                client->client_port);
+
+        handle_client(client);
+
+        printf("[Worker %d] Finished client\n", worker_id);
+    }
+    return NULL;    
 }
 
 int main(){
+    
+    queue_init(&job_queue);
+
+    pthread_t workers[THREAD_POOL_SIZE];
+    
+    for(int i=0;i<THREAD_POOL_SIZE;i++){
+        int *id = malloc(sizeof(int));
+        *id = i;
+        if(pthread_create(&workers[i],NULL,worker_thread,id)!=0){
+            perror("Thread-create");
+            exit(EXIT_FAILURE);
+        }
+        pthread_detach(workers[i]);
+    }
+
     int server_fd = create_server_socket();
+
     while(1){
         struct sockaddr_in client_addr;
         //below line waits until TCP three way handshake is done
         int client_fd = accept_client(server_fd,&client_addr);
         
-        pthread_t tid;
+        // pthread_t tid;
 
         ClientInfo *client = malloc(sizeof(ClientInfo));
         if (client == NULL) {
@@ -546,14 +655,16 @@ int main(){
 
         client->client_port = ntohs(client_addr.sin_port);
 
-        if (pthread_create(&tid, NULL, handle_client, client) != 0) {
-            perror("pthread_create");
-            free(client);
-            close(client_fd);
-            continue;
-        }
+        enqueue(&job_queue,client);
 
-        pthread_detach(tid);    
+        // if (pthread_create(&tid, NULL, handle_client, client) != 0) {
+        //     perror("pthread_create");
+        //     free(client);
+        //     close(client_fd);
+        //     continue;
+        // }
+
+        // pthread_detach(tid);    
     }
 
     close(server_fd);    
