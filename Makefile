@@ -1,11 +1,13 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -Wpedantic
 
-all: server 
+all: server
+	./s
 
 server: server.c
 	$(CC) $(CFLAGS) server.c -o s -pthread
 
 clean:
-	rm -f s 
+	rm -f s
 
+.PHONY: all clean

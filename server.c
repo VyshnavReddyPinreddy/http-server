@@ -5,7 +5,6 @@
 #include<netinet/in.h>
 #include<arpa/inet.h>
 #include<string.h>
-#include<pthread.h>
 #include<sys/time.h>
 #include<errno.h>
 #include <limits.h> // Gives PATH_MAX
@@ -13,21 +12,30 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/sendfile.h>
+#include<time.h>
+
+#include <sys/epoll.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 1024
 #define MAX_HEADERS 32
 #define DOCUMENT_ROOT "www"
-#define THREAD_POOL_SIZE 4
-#define QUEUE_SIZE 128
 
-enum CloseReason {
-    CLOSE_TIMEOUT,
-    CLOSE_CLIENT,
-    CLOSE_ERROR,
-    CLOSE_HTTP_ERROR,
-    CLOSE_HTTP_CLOSE
-};
+#define MAX_EVENTS 64
+
+// for keep-alive
+
+#define MAX_CLIENTS 1024
+#define KEEP_ALIVE_TIMEOUT 5
+
+typedef struct {
+    int fd;
+    char ip[INET_ADDRSTRLEN];
+    uint16_t port;
+    time_t last_activity;
+} Client;
+
+Client clients[MAX_CLIENTS];
 
 typedef struct{
     char key[64];
@@ -45,30 +53,9 @@ typedef struct {
 } HttpRequest;
 
 typedef struct {
-    int client_fd;
-    char client_ip[INET_ADDRSTRLEN];
-    int client_port;
-} ClientInfo;
-
-typedef struct {
-    ClientInfo *jobs[QUEUE_SIZE];
-    int front;
-    int rear;
-    int count;
-    pthread_mutex_t mutex;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
-} JobQueue;
-
-typedef struct {
     int status_code;
     size_t bytes_sent;
 } ResponseInfo;
-
-// Global Job Queue
-
-JobQueue job_queue;
-
 
 int create_server_socket(){
     // Create Socket
@@ -112,25 +99,19 @@ int create_server_socket(){
     return server_fd;
 }
 
-int accept_client(int server_fd, struct sockaddr_in *client_addr){
-    socklen_t client_len = sizeof(*client_addr);
-
-    // Accept one client
-    int client_fd = accept(server_fd,(struct sockaddr*)client_addr,&client_len);
-
-    if(client_fd<0){
-        perror("Accept");
-        close(server_fd);
+void set_nonblocking(int fd){
+    int flags = fcntl(fd,F_GETFL,0);
+    if(flags==-1){
+        perror("fcntl(F_GETFL)");
         exit(EXIT_FAILURE);
-    }    
+    }
 
-    char ip[INET_ADDRSTRLEN];
-
-    inet_ntop(AF_INET,&client_addr->sin_addr,ip,sizeof(ip)); // to get ip address of client
-
-    printf("Client connected from %s:%d\n",ip,ntohs(client_addr->sin_port));
-    return client_fd;
+    if(fcntl(fd,F_SETFL,flags | O_NONBLOCK)==-1){
+        perror("fcntl(F_SETFL)");
+        exit(EXIT_FAILURE);
+    }
 }
+
 
 int should_keep_alive(HttpRequest *request){
     for(int i=0;i<request->header_count;i++){
@@ -233,26 +214,6 @@ int read_file(const char *filename,void **buffer,size_t *file_size){
 }
 
 size_t serve_file(int client_fd,const char*filename,const char *content_type,int keep_alive,int send_body){
-    // ----------------- Before sendfile() -----------------------------------
-    
-    // void *body = NULL;
-    // size_t body_length = 0;
-
-    // if(read_file(filename,&body,&body_length)!=0){
-    //     // const char *msg = "404 Not Found";
-    //     // send_response(client_fd,"404 Not Found","text/plain",msg,strlen(msg),keep_alive,send_body);
-    //     // return strlen(msg);
-    //     perror("read_file");
-    //     return 0;
-    // }
-    // // printf("Read %d bytes from %s\n", bytes, filename);
-    // send_response(client_fd,"200 OK",content_type,body,body_length,keep_alive,send_body);
-
-    // free(body);
-    // return body_length;
-
-    // --------------- Using sendfile() --------------------------------------
-
     int fd = open(filename,O_RDONLY);
     if(fd<0){
         perror("open");
@@ -321,6 +282,22 @@ const char *get_mime_type(const char *filename){
         return "image/x-icon";
 
     return "application/octet-stream";
+}
+
+void cleanup_idle_clients(int epoll_fd){
+    time_t now = time(NULL);
+    for (int i=0;i<MAX_CLIENTS;i++){
+        if (clients[i].fd == -1) continue;
+
+        if(now-clients[i].last_activity>=KEEP_ALIVE_TIMEOUT){
+                printf("Closing idle client %s:%u\n",
+                                                    clients[i].ip,
+                                                    clients[i].port);
+            epoll_ctl(epoll_fd, EPOLL_CTL_DEL, i, NULL);
+            close(i);
+            clients[i].fd = -1;
+        }
+    }
 }
 
 int resolve_path(const char*request_path,char *resolved_path){
@@ -422,54 +399,32 @@ const char *format_size(size_t bytes,double *value){
     return "B";
 }
 
-void handle_client(ClientInfo *client){
-    int client_fd = client->client_fd;
-    char client_ip[INET_ADDRSTRLEN];
-    strcpy(client_ip,client->client_ip);
-    int client_port = client->client_port;
-
-    free(client);  
-
-    struct timeval timeout;
-    timeout.tv_sec = 5;
-    timeout.tv_usec = 0;
-
-    setsockopt(client_fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
-
-    enum CloseReason reason = CLOSE_CLIENT;
-
-    while(1){
+int handle_client(int client_fd){
+    // while(1){
         // Receive message
         ssize_t bytes;
         char buffer[BUFFER_SIZE] = {0};
 
         bytes = recv(client_fd,buffer,BUFFER_SIZE-1,0);
         if(bytes<0){
-            if(errno==EAGAIN || errno==EWOULDBLOCK){
-                reason = CLOSE_TIMEOUT;
-            }else{
+            if(errno!=EAGAIN && errno!=EWOULDBLOCK){
                 perror("recv");
-                reason = CLOSE_ERROR;
             }
-            break;
+            return 0;
         }else if(bytes==0){
             //TCP uses a FIN packet to say: "I have no more data to send."
             // So bytes=0 , and client closed the connection 
             // printf("[%s:%d] Client closed connection.\n", client_ip, client_port);
-            reason = CLOSE_HTTP_CLOSE;
-            break;
+            // reason = CLOSE_HTTP_CLOSE;
+            return 0;
         }
 
         buffer[bytes]='\0';
 
-        // printf("\n========== HTTP REQUEST ==========\n");
-        // printf("%s\r\n",buffer);
-        // printf("==================================\n");
 
         HttpRequest request;
         if (parse_http_request(buffer, &request) != 0){
-            reason = CLOSE_HTTP_ERROR;
-            break;
+            return 0;
         }
 
         int keep_alive = should_keep_alive(&request);
@@ -481,190 +436,144 @@ void handle_client(ClientInfo *client){
 
         clock_gettime(CLOCK_MONOTONIC, &end);
 
-        double elapsed_ms = (end.tv_sec-start.tv_sec)*1000.0 + (end.tv_nsec-start.tv_nsec)/1000000.0;
-
-        char client_addr[64];
-        snprintf(client_addr,
-                sizeof(client_addr),
-                "%s:%d",
-                client_ip,
-                client_port);   
+        double elapsed_ms =
+            (end.tv_sec-start.tv_sec)*1000.0 +
+            (end.tv_nsec-start.tv_nsec)/1000000.0;
 
         double size_value;
         const char *size_unit = format_size(res.bytes_sent, &size_value);
 
-        printf("%-21s %-6s %-20s %-6d %7.1f %-2s %8.3f ms\n",
-                                                            client_addr,
-                                                            request.method,
-                                                            request.path,
-                                                            res.status_code,
-                                                            size_value,
-                                                            size_unit,
-                                                            elapsed_ms);
+        printf("%-6s %-20s %-6d %7.1f %-2s %8.3f ms\n",
+       request.method,
+       request.path,
+       res.status_code,
+       size_value,
+       size_unit,
+       elapsed_ms);
 
-        if(!keep_alive){
-            reason = CLOSE_CLIENT;
-            break;
-        }
-    }   
+       clients[client_fd].last_activity = time(NULL);
 
-    switch (reason) {
-        case CLOSE_TIMEOUT:
-            printf("[%s:%d] Connection closed (Keep-Alive timeout).\n",
-                client_ip, client_port);
-            break;
 
-        case CLOSE_CLIENT:
-            printf("[%s:%d] Connection closed by client.\n",
-                client_ip, client_port);
-            break;
+    // }   
+    return keep_alive;
 
-        case CLOSE_ERROR:
-            printf("[%s:%d] Connection closed due to recv error.\n",
-                client_ip, client_port);
-            break;
-
-        case CLOSE_HTTP_ERROR:
-            printf("[%s:%d] Connection closed due to HTTP request error.\n",
-                client_ip, client_port);
-            break;
-        case CLOSE_HTTP_CLOSE:
-            printf("[%s:%d] Connection closed (HTTP Connection: close).\n",
-                client_ip, client_port);
-            break;
-    }   
-    close(client_fd);   
-}
-
-void queue_init(JobQueue *queue){
-    queue->front = 0;
-    queue->rear  = 0;
-    queue->count=0;
-
-    pthread_mutex_init(&queue->mutex,NULL);
-    pthread_cond_init(&queue->not_empty,NULL);
-    pthread_cond_init(&queue->not_full,NULL);
-}
-
-void enqueue(JobQueue *queue,ClientInfo *client){
-    pthread_mutex_lock(&queue->mutex); // for avoiding race conditions on QUEUE
-
-    while(queue->count==QUEUE_SIZE){
-        pthread_cond_wait(&queue->not_full,&queue->mutex); // Wait until queue is NOT full . so that we can push one 
-    }
-
-    // queue is not full, so push a client into the queue
-
-    queue->jobs[queue->rear] = client;
-    queue->rear = (queue->rear+1)%QUEUE_SIZE;
-
-    queue->count++;
-
-    printf("[Main] Enqueued %s:%d | Queue size = %d\n",
-       client->client_ip,
-       client->client_port,
-       queue->count);
-
-    // signal queue is not empty, so that , any worker who wants to execute a job, might wake up    
-    pthread_cond_signal(&queue->not_empty);
-    pthread_mutex_unlock(&queue->mutex);
-}
-
-ClientInfo *dequeue(JobQueue *queue,int worker_id){
-    pthread_mutex_lock(&queue->mutex);   
-    
-    while(queue->count==0){
-        pthread_cond_wait(&queue->not_empty,&queue->mutex);
-    }
-
-    ClientInfo *client = queue->jobs[queue->front];
-    queue->front = (queue->front+1)%QUEUE_SIZE;
-
-    queue->count--;
-
-    printf("[Worker %d] Dequeued %s:%d | Queue size = %d\n",
-       worker_id,
-       client->client_ip,
-       client->client_port,
-       queue->count);
-
-    pthread_cond_signal(&queue->not_full);
-    pthread_mutex_unlock(&queue->mutex);
-
-    return client;
-}
-
-void *worker_thread(void *arg){
-    int worker_id = *(int*)arg;
-    free(arg);
-
-    printf("[Worker %d] Started\n", worker_id);
-
-    while(1){
-        ClientInfo *client = dequeue(&job_queue,worker_id);
-
-        printf("[Worker %d] Picked client %s:%d\n",
-                worker_id,
-                client->client_ip,
-                client->client_port);
-
-        handle_client(client);
-
-        printf("[Worker %d] Finished client\n", worker_id);
-    }
-    return NULL;    
 }
 
 int main(){
-    
-    queue_init(&job_queue);
-
-    pthread_t workers[THREAD_POOL_SIZE];
-    
-    for(int i=0;i<THREAD_POOL_SIZE;i++){
-        int *id = malloc(sizeof(int));
-        *id = i;
-        if(pthread_create(&workers[i],NULL,worker_thread,id)!=0){
-            perror("Thread-create");
-            exit(EXIT_FAILURE);
-        }
-        pthread_detach(workers[i]);
-    }
 
     int server_fd = create_server_socket();
+    // It's a prerequisite for epoll,   
+    // Non-blocking mode makes those calls return immediately with EAGAIN/EWOULDBLOCK if nothing's available,
+    // so your loop never stalls on one fd while others are ready.
+    set_nonblocking(server_fd);
+
+    // A kernel object that stores all the file descriptors you want Linux to monitor.
+    // Creates the epoll instance itself — an in-kernel data structure
+    // (historically a red-black tree + ready list) that tracks a set of fds you care about.
+    // epoll_fd is your handle to that structure. The 0 argument is just flags (you're not passing EPOLL_CLOEXEC).
+
+    // default - Level-Triggered ( which means , until data is read fully from a buffer, it keeps on sending that fd is readable)
+    // while Event-Triggered, tells that only once. 
+
+    // This means with ET, your code has a hard requirement:
+    // whenever you get an EPOLLIN event, you must loop recv() (or accept()) until it returns EAGAIN/EWOULDBLOCK, 
+    // in the same way your accept-loop already does. 
+    // If you stop early — say you recv() once and there's still 500 bytes left in the buffer —
+    // epoll will never tell you again, and that connection just silently stalls forever (or until more data happens to arrive and re-trigger the edge).
+    
+    // ET is generally more efficient at very high fd counts / high event rates,
+    // because the kernel does less bookkeeping
+
+    int epoll_fd = epoll_create1(0);
+    if(epoll_fd==-1){
+        perror("epoll_create1");
+        exit(EXIT_FAILURE);
+    }
+
+    struct epoll_event ev;
+
+    ev.events = EPOLLIN;
+    ev.data.fd = server_fd;
+
+    // The kernel stores this registration in its internal epoll data structure.
+    if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,server_fd,&ev)==-1){
+        // adds  server_fd to the set of fds you're watching for me, under this epoll instance (epoll_fd)
+        perror("epoll_ctl");
+        exit(EXIT_FAILURE);
+    }
+
+    struct epoll_event events[MAX_EVENTS]; // watches for max_events number of ready events . like a batch
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        clients[i].fd = -1;
+    }
 
     while(1){
-        struct sockaddr_in client_addr;
-        //below line waits until TCP three way handshake is done
-        int client_fd = accept_client(server_fd,&client_addr);
-        
-        // pthread_t tid;
-
-        ClientInfo *client = malloc(sizeof(ClientInfo));
-        if (client == NULL) {
-            perror("malloc");
-            close(client_fd);
+        int ready = epoll_wait(epoll_fd,events,MAX_EVENTS,1000); //1000 indicates wake up every second, run cleanup, go back to sleep 
+        // epoll_wait() fills events[] with only the fds that are currently in one of these "ready" states, and returns ready, the count. 
+        // That's the efficiency win — you don't scan every registered fd, only the ones that actually have something to do.
+        if(ready==-1){
+            perror("EPOLL_WAIT");
             continue;
         }
-        client->client_fd = client_fd;
+        cleanup_idle_clients(epoll_fd);
+        for(int i=0;i<ready;i++){
+            if(events[i].data.fd==server_fd){   
+                // server_fd (the listening socket) is readable →
+                // a new incoming connection is waiting in the accept queue.
+                while(1){
+                    struct sockaddr_in client_addr;
+                    socklen_t client_len = sizeof(client_addr);
+                    
+                    int client_fd = accept(server_fd,(struct sockaddr*)&client_addr,&client_len);
+                    
+                    if(client_fd==-1){
+                        if(errno==EAGAIN || errno==EWOULDBLOCK){
+                            break;
+                        }
+                        perror("accept");
+                        break;
+                    }
 
-        inet_ntop(AF_INET,
-                &client_addr.sin_addr,
-                client->client_ip,
-                sizeof(client->client_ip));
+                    clients[client_fd].fd = client_fd;
+                    clients[client_fd].last_activity = time(NULL);
 
-        client->client_port = ntohs(client_addr.sin_port);
+                    set_nonblocking(client_fd);
 
-        enqueue(&job_queue,client);
+                    char ip[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET,&client_addr.sin_addr,ip,sizeof(ip));
 
-        // if (pthread_create(&tid, NULL, handle_client, client) != 0) {
-        //     perror("pthread_create");
-        //     free(client);
-        //     close(client_fd);
-        //     continue;
-        // }
+                    strcpy(clients[client_fd].ip, ip);
+                    clients[client_fd].port = ntohs(client_addr.sin_port);
 
-        // pthread_detach(tid);    
+                    printf("Client connected from %s:%d\n",ip,ntohs(client_addr.sin_port));
+
+                    struct epoll_event client_event;
+
+                    client_event.events = EPOLLIN;
+                    client_event.data.fd = client_fd;
+
+                    if(epoll_ctl(epoll_fd,EPOLL_CTL_ADD,client_fd,&client_event)==-1){
+                        perror("epoll_ctl client");
+                        close(client_fd);
+                        clients[client_fd].fd = -1;
+                    }
+
+                }
+            }else{
+                // a client_fd is readable → the client has sent bytes that are 
+                // sitting in the kernel's receive buffer, waiting for you to recv() them.
+
+                int client_fd = events[i].data.fd; 
+                int keep_alive = handle_client(client_fd);
+
+                if(!keep_alive){
+                    epoll_ctl(epoll_fd,EPOLL_CTL_DEL,client_fd,NULL);
+                    clients[client_fd].fd = -1;
+                    close(client_fd);
+                }
+            }
+        }
     }
 
     close(server_fd);    
